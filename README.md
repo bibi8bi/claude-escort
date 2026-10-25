@@ -15,16 +15,19 @@
 | L1 / L2 / L3 工人 | `agents/L1轻活.md` 等 | 按难度分档派活：haiku / sonnet / opus |
 | 任务树 | `skills/escort/scripts/task-tree.sh` | 把 `task_plan.md` 的勾选框渲染成纯文字进度树 |
 | 心跳 | `skills/escort/scripts/heartbeat.js` | 挂在子 agent 启停 hook 上，让主会话数得清「还剩几个在跑」 |
+| 压缩无用上下文 | `skills/compact-context/SKILL.md` | 压缩前先把只在对话里的东西写进存档，再给你一行 `/compact` 命令；压完先读存档接着干 |
+| 压完叫醒 | `skills/compact-context/scripts/wake-after-compact.sh` | 后台盯会话记录，见到压缩完成就退出、把会话叫醒，不用你再发一句「继续」 |
 
 ## 安装
 
 ```bash
 git clone https://github.com/bibi8bi/claude-escort.git
 cp -r claude-escort/skills/escort ~/.claude/skills/
+cp -r claude-escort/skills/compact-context ~/.claude/skills/   # 可选：压缩无用上下文
 cp claude-escort/agents/*.md ~/.claude/agents/
 ```
 
-新开一个 Claude Code 会话就能用。任务树要 `bash`、`git`、`awk`；心跳要 `node`。
+新开一个 Claude Code 会话就能用。任务树要 `bash`、`git`、`awk`；心跳要 `node`；压完叫醒要 `bash`。
 
 ## 怎么用
 
@@ -41,6 +44,8 @@ bash ~/.claude/skills/escort/scripts/task-tree.sh --全
 ```
 
 它读当前目录的 `task_plan.md`：顶层 `- [ ]` 是大任务，缩进的 `- [ ]` 是子任务；条目里写 `阻塞:` 算卡住，写 `〔等用户〕` / `〔等外部〕` 算在等人；写上 `YYYY-MM-DD` 登记日期就会算挂了几天。文件里写一行 `- 终点:<这个项目做完是什么样>`，会显示在树顶。加 `--base <commit>` 会把这之后翻勾的条目标上 ★。
+
+**压缩无用上下文**：`压缩无用上下文`。觉得上下文太长、该清一清时随时说，不用等快满。它先把当前的活、做到哪、刚定的取舍、在跑的后台任务、正在查的报错、接下来要用的 skill 这六项写进一份存档，再给你一行能直接粘的 `/compact …` 命令。给命令之前它会在后台起压完叫醒脚本，你敲完 `/compact`，会话压完会自己接着干。它不提交、不写进度文件。
 
 ## 可选：心跳 hook
 
