@@ -22,7 +22,7 @@ START="$(stat -c %s "$F" 2>/dev/null || stat -f %z "$F")"
 waited=0
 while [ "$waited" -lt "$MAX" ]; do
   if tail -c +"$((START + 1))" "$F" | grep -q '"subtype":"compact_boundary"'; then
-    sleep 3   # 等压后钩子的注入写完再叫醒
+    sleep 3   # 压缩后若有 hook 往会话里写内容,等它写完再叫醒
     echo "[压完叫醒] 压缩已完成。按 skill compact-context「压完之后第一轮」接着干${ARCHIVE:+:先读 $ARCHIVE}"
     exit 0
   fi
