@@ -17,6 +17,10 @@
 | 心跳 | `skills/escort/scripts/heartbeat.js` | 挂在子 agent 启停 hook 上，让主会话数得清「还剩几个在跑」 |
 | 压缩无用上下文 | `skills/compact-context/SKILL.md` | 压缩前先把只在对话里的东西写进存档，再给你一行 `/compact` 命令；压完先读存档接着干 |
 | 压完叫醒 | `skills/compact-context/scripts/wake-after-compact.sh` | 后台盯会话记录，见到压缩完成就退出、把会话叫醒，不用你再发一句「继续」 |
+| 长跑 | `skills/escort/SKILL.md` 戊节 | 「护航 长跑 <活>」：上下文到线不换窗口，先收尾、再自动压缩、压完接着干，要拍板才停 |
+| 上下文闸 | `skills/escort/scripts/context-gate.js` | 挂在 hook 上算上下文占了几成：到线提醒收尾；长跑会话还会拦停、守自动压缩、压完归零重算 |
+| 压缩后快照 | `skills/escort/scripts/post-compact-snapshot.sh` | 压缩完把 git log、分支和改动、进度最新一条、任务树塞回上下文 |
+| 闸的用例 | `skills/escort/scripts/test-context-gate.sh` | 上面两个脚本的自测，全在临时目录里跑，末行 `PASS n/n` |
 
 ## 安装
 
@@ -27,7 +31,7 @@ cp -r claude-escort/skills/compact-context ~/.claude/skills/   # 可选：压缩
 cp claude-escort/agents/*.md ~/.claude/agents/
 ```
 
-新开一个 Claude Code 会话就能用。任务树要 `bash`、`git`、`awk`；心跳要 `node`；压完叫醒要 `bash`。
+新开一个 Claude Code 会话就能用。任务树要 `bash`、`git`、`awk`；心跳和上下文闸要 `node`；压完叫醒、压缩后快照要 `bash`。
 
 ## 怎么用
 
@@ -45,6 +49,8 @@ bash ~/.claude/skills/escort/scripts/task-tree.sh --全
 
 它读当前目录的 `task_plan.md`：顶层 `- [ ]` 是大任务，缩进的 `- [ ]` 是子任务；条目里写 `阻塞:` 算卡住，写 `〔等用户〕` / `〔等外部〕` 算在等人；写上 `YYYY-MM-DD` 登记日期就会算挂了几天。文件里写一行 `- 终点:<这个项目做完是什么样>`，会显示在树顶。加 `--base <commit>` 会把这之后翻勾的条目标上 ★。
 
+**长跑**：`护航 长跑 把剩下的 8 个接口补上权限校验`。跟护航一样跑，只是上下文到线不换窗口：先写进度、提交，再让 Claude Code 自动压缩，压完接着干下一格，要你拍板时弹窗问。机器那一半要先挂上下面「可选：长跑 hook」；开窗前最好先敲 `/goal <什么算干完>`，细节见 `SKILL.md` 戊节。
+
 **压缩无用上下文**：`压缩无用上下文`。觉得上下文太长、该清一清时随时说，不用等快满。它先把当前的活、做到哪、刚定的取舍、在跑的后台任务、正在查的报错、接下来要用的 skill 这六项写进一份存档，再给你一行能直接粘的 `/compact …` 命令。给命令之前它会在后台起压完叫醒脚本，你敲完 `/compact`，会话压完会自己接着干。它不提交、不写进度文件。
 
 ## 可选：心跳 hook
@@ -58,9 +64,44 @@ bash ~/.claude/skills/escort/scripts/task-tree.sh --全
 
 日志写到 `~/.claude/escort-heartbeat.log`，想换位置就设环境变量 `ESCORT_HEARTBEAT_LOG`。超过 2MB 自动截到最后 500 行。
 
+## 可选：长跑 hook
+
+长跑和上下文提醒要靠 `context-gate.js` 和 `post-compact-snapshot.sh` 挂在 hook 上。不装也能用护航，只是没人替你盯上下文。在 `~/.claude/settings.json` 的 `hooks` 里加这五个挂点（SessionStart 那个挂两条）：
+
+```json
+"Stop": [{"matcher": "", "hooks": [{"type": "command", "command": "node ~/.claude/skills/escort/scripts/context-gate.js", "timeout": 5}]}],
+"PreToolUse": [{"matcher": "", "hooks": [{"type": "command", "command": "node ~/.claude/skills/escort/scripts/context-gate.js", "timeout": 5}]}],
+"PreCompact": [{"matcher": "auto", "hooks": [{"type": "command", "command": "node ~/.claude/skills/escort/scripts/context-gate.js", "timeout": 5}]}],
+"SessionStart": [{"matcher": "compact", "hooks": [
+  {"type": "command", "command": "node ~/.claude/skills/escort/scripts/context-gate.js", "timeout": 5},
+  {"type": "command", "command": "bash ~/.claude/skills/escort/scripts/post-compact-snapshot.sh", "timeout": 10}
+]}],
+"UserPromptSubmit": [{"matcher": "", "hooks": [{"type": "command", "command": "node ~/.claude/skills/escort/scripts/context-gate.js", "timeout": 5}]}]
+```
+
+- **五个都别加 `"async": true`**。Stop、PreToolUse、PreCompact 设了 async 就回不了「拦下 / 注入」，闸等于没装；SessionStart 设了，压缩后快照可能进不了上下文；UserPromptSubmit 设了，长跑标记可能比第一次 Stop 还晚记上。
+- **已经有同名挂点的，把上面那一项追加进原来的数组，别整段覆盖**，不然你原来的 hook 就没了。比如原来已有 `"Stop": [A]`，改成 `"Stop": [A, 上面那项]`。
+- 五个挂点是同一行命令，脚本自己看事件名分路。
+
+挂完自查（读 `settings.json`，每行该是 `ok`）：
+
+```bash
+node -e 'const h=(require(require("os").homedir()+"/.claude/settings.json").hooks)||{};for(const [e,f] of [["Stop","context-gate.js"],["PreToolUse","context-gate.js"],["PreCompact","context-gate.js"],["SessionStart","context-gate.js"],["SessionStart","post-compact-snapshot.sh"],["UserPromptSubmit","context-gate.js"]])console.log(JSON.stringify(h[e]||[]).includes(f)?"ok  ":"缺  ",e,f)'
+```
+
+再跑一遍用例确认脚本在你机器上能跑：`bash ~/.claude/skills/escort/scripts/test-context-gate.sh`，末行 `PASS n/n` 就对了。
+
+**环境变量**（全可不设，完整清单在 `context-gate.js` 头注释）：
+
+- `ESCORT_CONTEXT_WINDOW`：窗口大小。用 100 万窗口的模型请设 `1000000`，不设的话没用到 20 万之前都按 20 万算，会提前提醒。最稳的设法是加在五条命令前面，例如 `"command": "ESCORT_CONTEXT_WINDOW=1000000 node ~/.claude/skills/escort/scripts/context-gate.js"`。
+- `ESCORT_GATE_PCT`：线，占窗口的百分数，默认 60。
+- `ESCORT_DATA_DIR`：数据文件放哪，默认 `~/.claude/escort/`（提醒记录、收尾记录、长跑名单、日志 `gate.log`）。
+
+**`autoCompactWindow`**：这是 Claude Code 自己的设置键，管「上下文涨到多少 token 自动压缩」。本套件不替你设，也不依赖某个具体值。长跑的节奏是：到线（`ESCORT_GATE_PCT`）先收尾，收完之后自动压缩才放行，所以闸的线要比自动压缩的触发点低一截，给收尾留出余量。**20 万窗口的人别照抄 100 万窗口的数**（比如 25 万）：那个数比你整个窗口还大，自动压缩的触发点就跟你的线对不上了。它是全局键，改了所有会话都吃；闸只在长跑会话里挡压缩，别的会话照常压。
+
 ## 可选：自己接的部分
 
-规则里有几处是「机器判」的：验收报告的判据复跑、改动范围对盘、子 agent 用量账单、上下文占比闸。这一版只给了规则和手工做法（命令都写在文档里），没带自动化脚本。想接的话，照文档里写的判法自己写 hook 或脚本就行。
+规则里有几处是「机器判」的：验收报告的判据复跑、改动范围对盘、子 agent 用量账单。这一版只给了规则和手工做法（命令都写在文档里），没带自动化脚本。想接的话，照文档里写的判法自己写 hook 或脚本就行。上下文占比闸已经带了脚本，见上面「可选：长跑 hook」。
 
 ## 配置
 
