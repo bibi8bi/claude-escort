@@ -2,7 +2,7 @@
 # post-compact-snapshot.sh —— 上下文被压缩之后,把盘上现状塞回上下文:git log 10 条、分支 + status、
 #   进度文件(progress.md)最新一条、任务树折叠版。挂 SessionStart matcher compact,stdin 是那次事件的 JSON。
 # 长跑会话(context-gate.js --is-long 判)多一句「对照 task_plan 未完格接着干」。
-# 不出声的情形:cwd 不在 git 仓、子 agent、坏输入。首行「[压缩后快照]」、末行「【快照完】」,末行没出来 = 被截断了。
+# 不出声的情形:cwd 不在 git 仓、子 agent(判法同 context-gate.js 的 isMain)、坏输入。首行「[压缩后快照]」、末行「【快照完】」,末行没出来 = 被截断了。
 # 任何错都 exit 0。
 set -u
 command -v timeout >/dev/null 2>&1 || timeout() { shift; "$@"; }   # macOS 没有 timeout:退回不限时
@@ -10,9 +10,10 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAYLOAD="$(cat)"
 IFS=$'\x1f' read -r CWD SID AGENT TP < <(printf '%s' "$PAYLOAD" | node -e '
 let s = ""; process.stdin.on("data", (c) => s += c).on("end", () => {
-  try { const d = JSON.parse(s); console.log(["cwd", "session_id", "agent_id", "transcript_path"].map((k) => String(d[k] || "").replace(/[\x1f\n]/g, " ")).join("\x1f")); } catch (_) {}
+  try { const d = JSON.parse(s); d.agent_id = d.agent_id || d.subagent_id; console.log(["cwd", "session_id", "agent_id", "transcript_path"].map((k) => String(d[k] || "").replace(/[\x1f\n]/g, " ")).join("\x1f")); } catch (_) {}
 });' 2>/dev/null) || exit 0
-[ -n "${CWD:-}" ] && [ -z "${AGENT:-}" ] || exit 0
+[ -n "${CWD:-}" ] || exit 0
+case "${AGENT:-}" in ""|claude-code) ;; *) exit 0 ;; esac   # 跟 context-gate.js 的 isMain 同一条:有 agent_id 且不是 claude-code 才算子 agent
 case "${TP:-}" in */subagents/agent-*.jsonl) exit 0 ;; esac
 ROOT="$(cd "$CWD" 2>/dev/null && git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 cd "$ROOT" || exit 0

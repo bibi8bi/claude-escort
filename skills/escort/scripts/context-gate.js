@@ -10,7 +10,7 @@
 //       PreToolUse 一窗几百次,进门先做长度节流:transcript 没比上次真算时长 ESCORT_GATE_MINGROW 字节就直接退出。
 //   · Stop(长跑会话、没到线、正要停、没有在跑的 /goal)—— 拦一次叫它接下一格;被拦出来那轮放行,所以每次想停只拦一回。
 //   · PreCompact(挂 matcher auto)—— 只守长跑会话:没收过尾、或收尾之后又涨了 ESCORT_GATE_COMPACT_STALE → 挡这次自动压缩;
-//       占用超过窗口 90% 一律放行(超限的压缩被挡 = 那次请求直接失败);手动 /compact、子 agent、非长跑会话一律放行。
+//       占用超过放行线一律放行(见下「放行线的来历」);手动 /compact、子 agent、非长跑会话一律放行。
 //   · SessionStart(挂 matcher compact)—— 压缩之后把本会话的提醒计数和收尾标记归零,往上下文打一句「压缩前的提醒作废」。
 //   · UserPromptSubmit —— 从用户这句话的头 3 个非空行认长跑口令,认出就记标记;stdout 不写字。
 //   · 命令行:--done [会话号] [transcript]  记「已收尾」(收尾 = 写进度文件 + 提交自己的改动),stdout 打当前占用;
@@ -29,14 +29,22 @@
 //   ESCORT_CONTEXT_WINDOW      窗口大小,token。用 100 万窗口的模型请设 1000000,不然没超 20 万之前都按 20 万算
 //   ESCORT_GATE_PCT            线,百分数,默认 60;设 0 = 必触发(用例用)
 //   ESCORT_GATE_STEP           到线后再提醒的涨幅,token,默认 20000;设 0 = 每次都提醒
-//   ESCORT_GATE_GRACE          普通会话 --done 之后多涨多少 token 以内不再提醒,默认 50000
-//   ESCORT_GATE_LONG_GRACE     长跑会话同上,默认 100000
-//   ESCORT_GATE_COMPACT_STALE  长跑会话收尾之后涨多少以内算「收尾新鲜」、放行自动压缩,默认 100000
+//   ESCORT_GATE_GRACE          普通会话 --done 之后多涨多少 token 以内不再提醒,默认窗口的 5%(20 万窗口 = 10000)
+//   ESCORT_GATE_LONG_GRACE     长跑会话同上,默认窗口的 10%
+//   ESCORT_GATE_COMPACT_STALE  长跑会话收尾之后涨多少以内算「收尾新鲜」、放行自动压缩,默认窗口的 10%
+//                              (这三个写了绝对值就用绝对值,不再按窗口算)
+//   ESCORT_GATE_PASS_AT        PreCompact 放行线,token;默认 min(窗口 × 0.9, 窗口 − 45000)
 //   ESCORT_GATE_MINGROW        PreToolUse 长度节流门槛,字节,默认 100000;设 0 = 每次都真算
-//   ESCORT_DATA_DIR            数据文件目录,默认 ~/.claude/escort/;下面五个可以单个改道:
+//   ESCORT_DATA_DIR            数据文件目录,默认 <配置目录>/escort/(配置目录 = CLAUDE_CONFIG_DIR,没设就是 ~/.claude);
+//                              下面五个可以单个改道:
 //   ESCORT_GATE_SEEN(seen.txt 提醒过的占用)ESCORT_GATE_DONE(done.txt 收尾时的占用)ESCORT_GATE_LONG(long.txt 长跑会话)
 //   ESCORT_GATE_CURSOR(cursor.txt 节流游标)ESCORT_GATE_LOG(gate.log 日志)
-//   ESCORT_PROJECTS_DIR        --done 没给 transcript 时去哪找,默认 ~/.claude/projects
+//   ESCORT_PROJECTS_DIR        --done 没给 transcript 时去哪找,默认 <配置目录>/projects
+//
+// 放行线的来历:按 Claude Code 2.1.310 的门槛,自动压缩点 = 窗口 − 20000 − 13000,封死点(再大请求直接失败)
+//   = 窗口 − 20000 − 3000;20 万窗口分别是 16.7 万、17.7 万。放行线取 min(窗口 × 0.9, 窗口 − 45000),
+//   20 万窗口 = 15.5 万,比自动压缩点低一截,不会把会话挡到封死。换 Claude Code 版本这几个数可能变,变了改 ESCORT_GATE_PASS_AT。
+//   副作用:20 万窗口下自动压缩一来多半已过放行线,守门基本只在大窗口(或自动压缩点调低了)时起作用。
 //   数据文件超过 2MB 自动截到最后 500 行。
 //
 // 日志(gate.log):制表符 8 列 —— ISO时间 / 会话号前12位 / 模型 / 当前占用 / 窗口 / 占比 / 线 / 动作
@@ -55,7 +63,8 @@
 //   · 主会话派完子 agent 后自己干等、期间一个工具都不调,Stop / PreToolUse 都不响;PreCompact 只守门不催。
 //   · 窗口靠猜:100 万窗口的会话在用到 20 万之前会被当成 20 万窗口,提前提醒。设 ESCORT_CONTEXT_WINDOW 就准了。
 //   · 占用是估的:tool_result 按字符折算,跟 Claude Code 自己的数差几千到两万 token。
-//   · 长跑口令靠正则认:「长跑」后面直接粘动词的(长跑模式处理这些)不认;没加引号聊「护航长跑那次」会被误认。
+//   · 长跑口令靠正则认:只认「方式词 + 长跑」挨着,或整行就是「长跑 / 长跑模式 / 开启长跑」;没带方式词又不是整行的
+//     (「好 开始 长跑」)不认;没加引号聊「护航长跑那次」会被误认。
 //   · PreCompact 被挡之后,Claude Code 每次发请求前都会再试一次自动压缩,没有冷却期;挡了对话不压、继续跑。
 
 const fs = require('fs');
@@ -65,23 +74,26 @@ const path = require('path');
 const num = (k, d) => { const n = Number(process.env[k]); return process.env[k] !== undefined && process.env[k] !== '' && Number.isFinite(n) && n >= 0 ? n : d; };
 const PCT = num('ESCORT_GATE_PCT', 60);
 const STEP = num('ESCORT_GATE_STEP', 20000);
-const GRACE = num('ESCORT_GATE_GRACE', 50000);
-const LONG_GRACE = num('ESCORT_GATE_LONG_GRACE', 100000);
-const COMPACT_STALE = num('ESCORT_GATE_COMPACT_STALE', 100000);
+const GRACE = num('ESCORT_GATE_GRACE', -1);              // -1 = 没设,按窗口比例算
+const LONG_GRACE = num('ESCORT_GATE_LONG_GRACE', -1);
+const COMPACT_STALE = num('ESCORT_GATE_COMPACT_STALE', -1);
+const PASS_AT = num('ESCORT_GATE_PASS_AT', -1);
+const ratio = (v, k, win) => (v >= 0 ? v : Math.round(k * win));
+const passAt = (win) => (PASS_AT >= 0 ? PASS_AT : Math.min(win * 0.9, win - 45000));
 const MINGROW = num('ESCORT_GATE_MINGROW', 100000);
 const WIN_ENV = num('ESCORT_CONTEXT_WINDOW', 0);
-const DIR = process.env.ESCORT_DATA_DIR || path.join(os.homedir(), '.claude', 'escort');
+const CONF = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const DIR = process.env.ESCORT_DATA_DIR || path.join(CONF, 'escort');
 const SEEN = process.env.ESCORT_GATE_SEEN || path.join(DIR, 'seen.txt');
 const DONE = process.env.ESCORT_GATE_DONE || path.join(DIR, 'done.txt');
 const LONG = process.env.ESCORT_GATE_LONG || path.join(DIR, 'long.txt');
 const CURSOR = process.env.ESCORT_GATE_CURSOR || path.join(DIR, 'cursor.txt');
 const LOG = process.env.ESCORT_GATE_LOG || path.join(DIR, 'gate.log');
-const PROJECTS = process.env.ESCORT_PROJECTS_DIR || path.join(os.homedir(), '.claude', 'projects');
-const SELF = `node ${__filename}`;
+const PROJECTS = process.env.ESCORT_PROJECTS_DIR || path.join(CONF, 'projects');
+const SELF = `node ${JSON.stringify(__filename)}`;   // 路径带空格也能原样粘贴
 
 const SMALL_WIN = 200000;
 const BIG_WIN = 1000000;
-const OVERFLOW = 0.9;      // 占用超过窗口这一成,自动压缩一律放行
 const IMG_TOK = 1600;      // 一张图估多少 token
 const MAX_BYTES = 2 * 1024 * 1024;
 const KEEP_LINES = 500;
@@ -89,14 +101,13 @@ const MAX_SCAN_BYTES = 64 * 1024 * 1024;
 const STDIN_TIMEOUT_MS = 2000;
 const DISPATCH_TOOLS = new Set(['Agent', 'Task']);
 
-// 长跑口令:①「长跑」和方式词挨着,谁先谁后都认;②单独成词的「长跑 / 长跑模式」,或紧贴「开启 / 进入 / 切到」。
-//   引号里举的例子先剥掉;放宽的两条只看每行前 40 个字和末 20 个字;②前 8 后 10 个字里有问句或否定词的不认。
+// 长跑口令:①「长跑」和方式词挨着,谁先谁后都认(引号里举的例子先剥掉,只看每行前 40 个字和末 20 个字);
+//   ②整行就是「长跑 / 长跑模式 / 开启·进入·切到长跑(模式)」,前后只许有空白和标点(问号不算)。
 const WAYS = '(?:全程护航|进阶并驾|护航|并驾|全力)';
 const LONG_RE = new RegExp(`^${WAYS}[\\s:：]*长跑`);
 const LONG_PAIR_RE = new RegExp(`${WAYS}[\\s:：]*长跑|长跑(?:模式)?[\\s:：]*${WAYS}`, 'g');
-const LONG_WORD_RE = /(?:^|[\s,，。;；:：])(?:开启|开始|进入|按)?长跑(?:模式)?(?:开始)?(?=$|[\s,，。;；:：!！])|(?:开启|进入|切到|切换到)长跑/g;
+const LONG_LINE_RE = /^[\s,，。.;；:：!！、~…]*(?:开启|进入|切到)?长跑(?:模式)?[\s,，。.;；:：!！、~…]*$/;
 const LONG_QUOTE_RE = /「[^」]*」|『[^』]*』|“[^”]*”|"[^"]*"|`[^`]*`/g;
-const LONG_NOT_RE = /不要|不用|别|先不|不做|不开|关掉|关闭|取消|退出|停掉|吗|呢|[?？]|怎么|咋|为啥|为什么|什么|是不是|能不能/;
 const LONG_HEAD = 40;
 const LONG_TAIL = 20;
 
@@ -113,7 +124,7 @@ const MSG_LONG = (pctStr, cur, win, again) => [
   `② ${WRAP}。记上收尾之后,自动压缩才放行。`,
   `③ 收完直接接着干下一格,不等用户;压缩完 hook 会把 git 状态和进度最新一条塞回来。`,
   `· 要用户拍板的事用 AskUserQuestion 弹窗问,别在正文里问完就停。`,
-  `· 收尾之后再涨 ${LONG_GRACE} token 会再催一次。`,
+  `· 收尾之后再涨 ${ratio(LONG_GRACE, 0.1, win)} token 会再催一次。`,
 ].join('\n');
 const LINE_NUDGE = '⏩ 长跑:没设 /goal —— 接下一格,别停';
 const MSG_NUDGE = (cur) => [
@@ -322,7 +333,7 @@ function run(p, sid, now) {
   const prev = lastVal(SEEN, sid);
   const again = prev >= 0;
   const doneAt = lastVal(DONE, sid);
-  const quiet = doneAt >= 0 && r.cur < doneAt + (long ? LONG_GRACE : GRACE);
+  const quiet = doneAt >= 0 && r.cur < doneAt + (long ? ratio(LONG_GRACE, 0.1, r.win) : ratio(GRACE, 0.05, r.win));
   const due = !quiet && !(again && r.cur < prev + STEP);
   const note = dispatch && !long;
   if (!due && !note) { log(r.head.concat([(quiet ? 'done' : 'latched') + tag])); return; }
@@ -351,17 +362,17 @@ function compactGate(p, sid, now) {
   if (!p.transcript_path) { blank(now, sid, '?/NO_PATH'); return; }
   const r = measure(p.transcript_path, now, sid);
   if (!r) return;
-  if (r.cur > r.win * OVERFLOW) { log(r.head.concat(['compact-pass/overflow'])); return; }
+  if (r.cur > passAt(r.win)) { log(r.head.concat(['compact-pass/overflow'])); return; }
   const doneAt = lastVal(DONE, sid);
-  if (doneAt >= 0 && r.cur - doneAt <= COMPACT_STALE) { log(r.head.concat(['compact-pass'])); return; }
+  if (doneAt >= 0 && r.cur - doneAt <= ratio(COMPACT_STALE, 0.1, r.win)) { log(r.head.concat(['compact-pass'])); return; }
   const since = doneAt >= 0 ? `最近一次收尾在占用 ${doneAt},之后又涨了 ${r.cur - doneAt}` : `还没收过尾(当前占用 ${r.cur})`;
   log(r.head.concat(['compact-block']));
-  emit({ decision: 'block', reason: `[context-gate] 拦下这次自动压缩:本会话${since}。先收尾:${WRAP};记上之后压缩会再来。占用超过窗口 90% 一律放行。` });
+  emit({ decision: 'block', reason: `[context-gate] 拦下这次自动压缩:本会话${since}。先收尾:${WRAP};记上之后压缩会再来。占用超过 ${Math.round(passAt(r.win))} token 一律放行。` });
 }
 
 // SessionStart(compact):提醒计数、收尾标记归零(记 -1 = 当作没有),往上下文打一句
 function afterCompact(p, sid, now) {
-  if (!isMain(p) || String(p.source || '') !== 'compact') return;
+  if (!isMain(p) || String(p.source || '') !== 'compact' || sid === '-') return;
   try { append(SEEN, sid + '\t-1\n'); append(DONE, sid + '\t-1\n'); } catch (_) { /* 铁规 2 */ }
   blank(now, sid, 'after-compact');
   try { fs.writeSync(1, AFTER_COMPACT_NOTE + '\n'); } catch (_) { /* 铁规 2 */ }
@@ -372,10 +383,7 @@ function isLongLine(x) {
   const s = x.replace(LONG_QUOTE_RE, '');
   const edge = (m) => m.index < LONG_HEAD || m.index + m[0].length > s.length - LONG_TAIL;
   for (const m of s.matchAll(LONG_PAIR_RE)) if (edge(m)) return true;
-  for (const m of s.matchAll(LONG_WORD_RE)) {
-    if (edge(m) && !LONG_NOT_RE.test(s.slice(Math.max(0, m.index - 8), m.index + m[0].length + 10))) return true;
-  }
-  return false;
+  return LONG_LINE_RE.test(s);
 }
 
 // UserPromptSubmit:认长跑口令,stdout 一个字不写

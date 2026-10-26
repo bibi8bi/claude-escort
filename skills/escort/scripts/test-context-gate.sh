@@ -11,7 +11,9 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/escort-gate-test.XXXXXX")" || { echo "FAIL 0/0: 
 trap 'rm -rf "$T"' EXIT
 for v in $(env | sed -n 's/^\(ESCORT_[A-Z_]*\)=.*/\1/p'); do unset "$v"; done   # 别让本机设的环境变量带歪用例
 unset CLAUDE_CODE_SESSION_ID
-export ESCORT_DATA_DIR="$T/data" ESCORT_PROJECTS_DIR="$T/projects"
+unset CLAUDE_CONFIG_DIR
+export HOME="$T/home" ESCORT_DATA_DIR="$T/data" ESCORT_PROJECTS_DIR="$T/projects"   # HOME 也改道:脚本哪处默认路径写错了也落不到真 ~/.claude
+mkdir -p "$HOME"
 LOGF="$T/data/gate.log"; SEENF="$T/data/seen.txt"; DONEF="$T/data/done.txt"; LONGF="$T/data/long.txt"
 mkdir -p "$T/projects/p1"
 
@@ -99,14 +101,16 @@ g_window_env() {
 }
 g_long_prompt() {
   local i=0 sid p out bad=""
-  for p in '护航 长跑 修登录页' '并驾:长跑' '长跑 护航 继续' '继续 长跑 护航' '长跑' '好 开始 长跑' '按推荐 开启长跑模式' '开始吧 护航长跑' "$(printf '护航\n护航 长跑 接着做')"; do
+  for p in '护航 长跑 修登录页' '并驾:长跑' '长跑 护航 继续' '继续 长跑 护航' '长跑' '长跑。' '开启长跑模式' ' 切到长跑 ' '好 护航长跑' "$(printf '护航\n护航 长跑 接着做')"; do
     i=$((i+1)); sid=$(printf 'lpos%08d' $i)
     out=$(node -e 'console.log(JSON.stringify({hook_event_name: "UserPromptSubmit", session_id: process.argv[1], prompt: process.argv[2]}))' "$sid" "$p" | node "$GATE")
     { [ -z "$out" ] && grep -qx "$sid" "$LONGF"; } || bad="$bad「$p」"
   done
   need is "$bad" ""
   bad=""
-  for p in '长跑 先不做' '长跑模式怎么用' '不是长跑模式吗' '护航 修「长跑口令」的识别' '护航 接着做长跑模式第二格' '今天不长跑了'; do
+  # 收紧后:没带方式词又不是整行的一律不认(「好 开始 长跑」「好的 开启长跑模式」原来认,现在不认)
+  for p in '长跑 先不做' '长跑模式怎么用' '不是长跑模式吗' '护航 修「长跑入口」的文案' '护航 接着写长跑模式的文档' '今天不长跑了' '长跑?' \
+           '今天 长跑 5 公里,帮我记一下' '帮我做个 长跑 打卡小程序' '按 长跑 的配速算一下' '好 开始 长跑' '好的 开启长跑模式'; do
     i=$((i+1)); sid=$(printf 'lneg%08d' $i)
     node -e 'console.log(JSON.stringify({hook_event_name: "UserPromptSubmit", session_id: process.argv[1], prompt: process.argv[2]}))' "$sid" "$p" | node "$GATE" >/dev/null
     ! grep -qx "$sid" "$LONGF" 2>/dev/null || bad="$bad「$p」"
@@ -154,14 +158,54 @@ g_precompact() {
   out=$(ev PreCompact cmp00000000a "$F" '{"trigger":"manual"}'); need empty "$out"; need is "$(act)" compact-manual
   out=$(ev PreCompact cmp00000000a "$F" '{"trigger":"auto","agent_id":"a1"}'); need empty "$out"
   use "$F" 3 185000; out=$(ESCORT_GATE_COMPACT_STALE=0 ev PreCompact cmp00000000a "$F" '{"trigger":"auto"}')
-  need empty "$out"; need is "$(act)" compact-pass/overflow     # 18.5 万 > 20 万的 90%
+  need empty "$out"; need is "$(act)" compact-pass/overflow     # 18.5 万 > 放行线 15.5 万
   node "$GATE" --done nobody-here 2>/dev/null; need is $? 1
 }
 g_done_grace() {
   local F="$T/grace.jsonl"; use "$F" 1 130000
   ev Stop grace000000a "$F" >/dev/null; node "$GATE" --done grace000000a "$F" >/dev/null
-  use "$F" 2 160000; local out; out=$(ev Stop grace000000a "$F"); need empty "$out"; need is "$(act)" done
-  out=$(ESCORT_GATE_GRACE=0 ev Stop grace000000a "$F"); need js "$out" 'd.systemMessage.includes("该收尾了")'   # 阴性对照
+  use "$F" 2 135000; local out; out=$(ev Stop grace000000a "$F"); need empty "$out"; need is "$(act)" done   # 宽限 = 20 万 × 5% = 1 万
+  out=$(ESCORT_GATE_STEP=0 ESCORT_GATE_GRACE=0 ev Stop grace000000a "$F"); need js "$out" 'd.systemMessage.includes("该收尾了")'   # 阴性对照
+  use "$F" 3 145000; out=$(ESCORT_GATE_STEP=0 ev Stop grace000000a "$F"); need js "$out" 'd.systemMessage.includes("该收尾了")'    # 涨 1.5 万 > 1 万 → 照催
+  out=$(ESCORT_GATE_STEP=0 ESCORT_GATE_GRACE=20000 ev Stop grace000000a "$F"); need empty "$out"; need is "$(act)" done            # 写了绝对值就用绝对值
+  local L="$T/grace-long.jsonl"; use "$L" 1 130000; node "$GATE" --long gracelong00a
+  ev Stop gracelong00a "$L" >/dev/null; node "$GATE" --done gracelong00a "$L" >/dev/null
+  use "$L" 2 145000; out=$(ev Stop gracelong00a "$L"); need empty "$out"; need is "$(act)" done/long             # 长跑宽限 = 2 万
+  use "$L" 3 152000; out=$(ESCORT_GATE_STEP=0 ev Stop gracelong00a "$L"); need js "$out" 'd.decision === "block"'
+}
+# 20 万窗口:Claude Code 自动压缩点约 16.7 万,放行线 min(18 万, 15.5 万) = 15.5 万
+g_pass_line_200k() {
+  local F="$T/pass.jsonl"; use "$F" 1 175000; node "$GATE" --long pass0000000a
+  local out; out=$(ev PreCompact pass0000000a "$F" '{"trigger":"auto"}'); need empty "$out"; need is "$(act)" compact-pass/overflow
+  out=$(ESCORT_CONTEXT_WINDOW=1000000 ev PreCompact pass0000000a "$F" '{"trigger":"auto"}')   # 阴性对照:100 万窗口时 17.5 万远没到放行线
+  need js "$out" 'd.decision === "block" && d.reason.includes("900000")'
+  out=$(ESCORT_GATE_PASS_AT=180000 ev PreCompact pass0000000a "$F" '{"trigger":"auto"}'); need js "$out" 'd.decision === "block"'   # 环境变量改线
+  local G2="$T/pass2.jsonl"; use "$G2" 1 150000
+  out=$(ev PreCompact pass0000000a "$G2" '{"trigger":"auto"}'); need js "$out" 'd.decision === "block"'   # 15 万 < 15.5 万 → 照挡
+}
+# 提示里的 --done 命令要能原样粘贴,哪怕脚本路径带空格
+g_space_path() {
+  local D="$T/dir with space"; mkdir -p "$D"; cp "$GATE" "$D/"
+  local F="$T/space.jsonl"; use "$F" 1 130000; node "$D/context-gate.js" --long space000000a
+  local out cmd
+  out=$(node -e 'console.log(JSON.stringify({hook_event_name: "Stop", session_id: "space000000a", transcript_path: process.argv[1]}))' "$F" | node "$D/context-gate.js")
+  cmd=$(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",c=>s+=c).on("end",()=>{const m=JSON.parse(s).reason.match(/node "[^"]+" --done/);console.log(m?m[0]:"")})')
+  need test -n "$cmd"
+  cp "$F" "$T/projects/p1/space000000a-full.jsonl"
+  local cur; cur=$(CLAUDE_CODE_SESSION_ID=space000000a-full bash -c "$cmd"); need is $? 0; need is "$cur" 130000
+}
+# 压缩后的 SessionStart 没带 session_id:不许往标记文件写 「-」那一行
+g_after_compact_no_sid() {
+  local out; out=$(printf '{"hook_event_name":"SessionStart","source":"compact","transcript_path":"/x.jsonl"}' | node "$GATE")
+  need empty "$out"; need test -z "$(grep -s '^-' "$SEENF" "$DONEF")"
+}
+# 没设 ESCORT_DATA_DIR 时数据目录跟着 CLAUDE_CONFIG_DIR 走,会话记录也去那下面找
+g_config_dir() {
+  local C="$T/cfg"; mkdir -p "$C/projects/q"; local F="$C/projects/q/cfg00000000a-x.jsonl"; use "$F" 1 120000
+  env -u ESCORT_DATA_DIR -u ESCORT_PROJECTS_DIR CLAUDE_CONFIG_DIR="$C" node "$GATE" --long cfg00000000a
+  need grep -qx cfg00000000a "$C/escort/long.txt"
+  local cur; cur=$(env -u ESCORT_DATA_DIR -u ESCORT_PROJECTS_DIR CLAUDE_CONFIG_DIR="$C" node "$GATE" --done cfg00000000a-x); need is "$cur" 120000
+  need test -s "$C/escort/done.txt"
 }
 g_after_compact() {
   local F="$T/ac.jsonl"; use "$F" 1 130000; node "$GATE" --long ac0000000000
@@ -189,11 +233,12 @@ g_snapshot() {
   node "$GATE" --long snap00000000a; out=$(snap "$R" snap00000000a); need grep -q '对照 task_plan 未完格接着干' <<<"$out"
   mkdir -p "$T/notgit"; out=$(snap "$T/notgit" snap00000000a); need is $? 0; need empty "$out"
   out=$(snap "$R" snap00000000a '{"agent_id":"a1"}'); need empty "$out"
+  out=$(snap "$R" snap00000000a '{"agent_id":"claude-code"}'); need is "$(tail -1 <<<"$out")" "【快照完】"   # 同闸:agent_id=claude-code 算主会话
   out=$(printf 'not json' | bash "$SNAP"); need is $? 0; need empty "$out"
 }
 
 for g in g_below_line_silent g_remind_once g_step_again g_pretooluse_inject g_throttle g_dispatch_note g_errors_silent g_window_env \
-         g_long_prompt g_long_cli g_long_block g_long_nudge g_precompact g_done_grace g_after_compact g_snapshot; do group "$g"; done
+         g_long_prompt g_long_cli g_long_block g_long_nudge g_precompact g_done_grace g_pass_line_200k g_space_path g_after_compact g_after_compact_no_sid g_config_dir g_snapshot; do group "$g"; done
 echo "----"
 if [ -z "$failed" ]; then echo "PASS $passed/$total"; exit 0; fi
 echo "FAIL $passed/$total:$failed"; exit 1

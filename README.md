@@ -83,10 +83,28 @@ bash ~/.claude/skills/escort/scripts/task-tree.sh --全
 - **已经有同名挂点的，把上面那一项追加进原来的数组，别整段覆盖**，不然你原来的 hook 就没了。比如原来已有 `"Stop": [A]`，改成 `"Stop": [A, 上面那项]`。
 - 五个挂点是同一行命令，脚本自己看事件名分路。
 
-挂完自查（读 `settings.json`，每行该是 `ok`）：
+挂完自查（读配置目录下的 `settings.json`：设了 `CLAUDE_CONFIG_DIR` 就读那里，没设读 `~/.claude/`）。每个挂点逐条看：命令里有没有那个脚本名、有没有设 `async`（设了就不能拦）、matcher 对不对（PreToolUse 要空或 `*`，PreCompact 要 `auto`，SessionStart 要 `compact`）。每行该是 `ok`，有一行 `错` 就照冒号后面那句改；读不到文件只打一行「缺 settings.json」：
 
 ```bash
-node -e 'const h=(require(require("os").homedir()+"/.claude/settings.json").hooks)||{};for(const [e,f] of [["Stop","context-gate.js"],["PreToolUse","context-gate.js"],["PreCompact","context-gate.js"],["SessionStart","context-gate.js"],["SessionStart","post-compact-snapshot.sh"],["UserPromptSubmit","context-gate.js"]])console.log(JSON.stringify(h[e]||[]).includes(f)?"ok  ":"缺  ",e,f)'
+node -e '
+const fs = require("fs"), path = require("path"), os = require("os");
+const f = path.join(process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude"), "settings.json");
+let h;
+try { h = JSON.parse(fs.readFileSync(f, "utf8")).hooks || {}; } catch (_) { console.log("缺 settings.json(" + f + " 读不到或不是合法 JSON)"); process.exit(1); }
+const want = [["Stop", "context-gate.js"], ["PreToolUse", "context-gate.js", ["", "*"]], ["PreCompact", "context-gate.js", ["auto"]],
+  ["SessionStart", "context-gate.js", ["compact"]], ["SessionStart", "post-compact-snapshot.sh", ["compact"]], ["UserPromptSubmit", "context-gate.js"]];
+let bad = 0;
+for (const [e, s, m] of want) {
+  const hits = [];
+  for (const g of h[e] || []) for (const k of (g && g.hooks) || []) if (String(k.command || "").includes(s)) hits.push([g, k]);
+  const good = hits.find(([g, k]) => k.async !== true && (!m || m.includes(g.matcher == null ? "" : g.matcher)));
+  let why = "";
+  if (!hits.length) why = "没挂";
+  else if (!good) why = hits[0][1].async === true ? "设了 async,要去掉" : "matcher 是 " + JSON.stringify(hits[0][0].matcher) + ",要 " + m.map((x) => JSON.stringify(x)).join(" 或 ");
+  console.log((why ? "错  " : "ok  ") + e + " " + s + (why ? ":" + why : ""));
+  if (why) bad = 1;
+}
+process.exit(bad);'
 ```
 
 再跑一遍用例确认脚本在你机器上能跑：`bash ~/.claude/skills/escort/scripts/test-context-gate.sh`，末行 `PASS n/n` 就对了。
@@ -95,9 +113,12 @@ node -e 'const h=(require(require("os").homedir()+"/.claude/settings.json").hook
 
 - `ESCORT_CONTEXT_WINDOW`：窗口大小。用 100 万窗口的模型请设 `1000000`，不设的话没用到 20 万之前都按 20 万算，会提前提醒。最稳的设法是加在五条命令前面，例如 `"command": "ESCORT_CONTEXT_WINDOW=1000000 node ~/.claude/skills/escort/scripts/context-gate.js"`。
 - `ESCORT_GATE_PCT`：线，占窗口的百分数，默认 60。
-- `ESCORT_DATA_DIR`：数据文件放哪，默认 `~/.claude/escort/`（提醒记录、收尾记录、长跑名单、日志 `gate.log`）。
+- `ESCORT_DATA_DIR`：数据文件放哪，默认 `<配置目录>/escort/`（配置目录 = `CLAUDE_CONFIG_DIR`，没设就是 `~/.claude`；里面是提醒记录、收尾记录、长跑名单、日志 `gate.log`）。
+- `ESCORT_GATE_GRACE` / `ESCORT_GATE_LONG_GRACE`：收尾之后再涨多少 token 以内不再催，默认窗口的 5% / 10%（20 万窗口 = 1 万 / 2 万）；写了绝对值就用绝对值。
+- `ESCORT_GATE_COMPACT_STALE`：长跑会话收尾之后涨多少以内算「收尾新鲜」、放行自动压缩，默认窗口的 10%；写了绝对值就用绝对值。
+- `ESCORT_GATE_PASS_AT`：占用超过这个 token 数，自动压缩一律放行。默认 `min(窗口 × 0.9, 窗口 − 45000)`：按 Claude Code 2.1.310，自动压缩点约是窗口 − 33000，再大到窗口 − 23000 请求就直接失败，放行线得比自动压缩点低。20 万窗口这条线是 15.5 万，自动压缩一来多半已过线，守门基本只在大窗口里起作用。换了 Claude Code 版本这几个数可能变。
 
-**`autoCompactWindow`**：这是 Claude Code 自己的设置键，管「上下文涨到多少 token 自动压缩」。本套件不替你设，也不依赖某个具体值。长跑的节奏是：到线（`ESCORT_GATE_PCT`）先收尾，收完之后自动压缩才放行，所以闸的线要比自动压缩的触发点低一截，给收尾留出余量。**20 万窗口的人别照抄 100 万窗口的数**（比如 25 万）：那个数比你整个窗口还大，自动压缩的触发点就跟你的线对不上了。它是全局键，改了所有会话都吃；闸只在长跑会话里挡压缩，别的会话照常压。
+**`autoCompactWindow`**：这是 Claude Code 自己的设置键，管「上下文涨到多少 token 自动压缩」。本套件不替你设，也不依赖某个具体值。长跑的节奏是：到线（`ESCORT_GATE_PCT`）先收尾，收完之后自动压缩才放行，所以闸的线要比自动压缩的触发点低一截，给收尾留出余量。**20 万窗口的人别照抄 100 万窗口的数**（比如一个大于 20 万的数）：那个数比你整个窗口还大，自动压缩的触发点就跟你的线对不上了。它是全局键，改了所有会话都吃；闸只在长跑会话里挡压缩，别的会话照常压。
 
 ## 可选：自己接的部分
 
